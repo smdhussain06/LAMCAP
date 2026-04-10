@@ -661,44 +661,42 @@ class ExecutorAgent:
         self.store = store
 
     def execute(self, task: dict) -> dict:
-        """
-        Execute a single task dict and return enriched results.
-
-        Args:
-            task: Must contain at least a "command" key.
-
-        Returns:
-            The task dict augmented with stdout, stderr, exit_code.
-        """
-        cmd = task.get("command", "")
+        """Execute a task and handle backgrounding detection."""
+        cmd = task.get("command", "").strip()
+        is_bg = cmd.endswith("&")
+        
         try:
-            proc = subprocess.run(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=self.TIMEOUT_SECONDS,
-                cwd=os.getcwd(),
-            )
-            task["stdout"] = proc.stdout
-            task["stderr"] = proc.stderr
-            task["exit_code"] = proc.returncode
-        except subprocess.TimeoutExpired:
-            task["stdout"] = ""
-            task["stderr"] = f"[LAMCAP] Command timed out after {self.TIMEOUT_SECONDS}s."
-            task["exit_code"] = -1
+            if is_bg:
+                # Use Popen to detach background processes
+                # Redirect to avoid hanging on pipes
+                safe_cmd = f"nohup {cmd} > /dev/null 2>&1" if ">" not in cmd else cmd
+                proc = subprocess.Popen(
+                    safe_cmd,
+                    shell=True,
+                    start_new_session=True, # Detach from terminal session
+                    cwd=os.getcwd()
+                )
+                task["stdout"] = f"[LAMCAP] Persistent background job started (PID: {proc.pid})"
+                task["stderr"] = ""
+                task["exit_code"] = 0
+            else:
+                proc = subprocess.run(
+                    cmd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.TIMEOUT_SECONDS,
+                    cwd=os.getcwd(),
+                )
+                task["stdout"] = proc.stdout
+                task["stderr"] = proc.stderr
+                task["exit_code"] = proc.returncode
         except Exception as exc:
             task["stdout"] = ""
             task["stderr"] = f"[LAMCAP] Execution error: {exc}"
             task["exit_code"] = -1
 
-        # Persist to the context store
-        self.store.log_execution(
-            command=cmd,
-            stdout=task["stdout"][:5000],
-            stderr=task["stderr"][:5000],
-            exit_code=task["exit_code"],
-        )
+        self.store.log_execution(cmd, task["stdout"], task["stderr"], task["exit_code"])
         return task
 
 
