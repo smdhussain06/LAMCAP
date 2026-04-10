@@ -383,29 +383,39 @@ class CloudEngine(BaseEngine):
         self.client = anthropic.Anthropic(base_url=self.base_url, api_key=self.api_key)
 
     def infer(self, system_prompt: str, user_message: str, max_tokens: int = 4096, stream: bool = False) -> str | Any:
+        import requests
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        data = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_message}],
+            "stream": stream
+        }
         try:
+            res = requests.post(f"{self.base_url}/v1/messages", headers=headers, json=data, stream=stream)
+            if res.status_code != 200:
+                raise ConnectionError(f"Cloud SDK Error {res.status_code}: {res.text}")
+                
             if stream:
-                # Returns a generator yielding streamed text chunks
                 def stream_gen():
-                    with self.client.messages.stream(
-                        model=self.model,
-                        max_tokens=max_tokens,
-                        system=system_prompt,
-                        messages=[{"role": "user", "content": user_message}],
-                    ) as s:
-                        for text in s.text_stream:
-                            yield text
+                    for line in res.iter_lines():
+                        if line:
+                            line_str = line.decode('utf-8')
+                            if line_str.startswith("data: "):
+                                try:
+                                    chunk = json.loads(line_str[6:])
+                                    if chunk.get("type") == "content_block_delta":
+                                        yield chunk.get("delta", {}).get("text", "")
+                                except: pass
                 return stream_gen()
             else:
-                response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=max_tokens,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_message}],
-                )
-                return "\n".join([b.text for b in response.content if hasattr(b, "text")])
-        except anthropic.APIConnectionError:
-            raise ConnectionError(f"[LAMCAP] Proxy unreachable at {self.base_url}")
+                out = res.json()
+                return "\n".join([c["text"] for c in out.get("content", []) if c.get("type") == "text"])
         except Exception as e:
             raise ConnectionError(f"[LAMCAP] Cloud inference error: {e}")
 
