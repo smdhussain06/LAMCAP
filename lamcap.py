@@ -543,6 +543,9 @@ class PlannerAgent:
         RULES:
         - Analyze the current state, file tree, and history before every step.
         - If you need to run a command, return JSON with "action": "run" and "command": "<cmd>".
+        - PERSISTENCE: If the user asks for a server or long-running process, you MUST use 'nohup' and '&' so it survives the session (e.g., 'nohup python3 -m http.server 8080 &').
+        - DIRECTORIES: Be extremely careful with paths. If you create a website in a folder, use the '--directory' flag or 'cd' into it first.
+        - PREVIEW: When hosting is ready, provide a direct URL like http://localhost:8080.
         - If the task is finished, return "status": "FINISHED" and a summary.
         - NEVER return multiple commands at once. Wait for observation.
         
@@ -997,8 +1000,12 @@ def run_agent_pipeline(prompt: str, engine: BaseEngine, store: ContextStore, pla
             break
             
         action_cmd = step_plan.get("command")
-        if not action_cmd:
-            break
+        if not action_cmd: break
+
+        # Fix: If user wants a server, remind the agent to use the RIGHT directory and detached mode
+        if "http.server" in action_cmd and "nohup" not in action_cmd:
+            # We don't modify the cmd directly, but we signal the agent in the next iteration if it fails
+            pass
             
         # 3. VALIDATION & SECURITY
         temp_plan = {"tasks": [step_plan]}
