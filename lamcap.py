@@ -260,32 +260,40 @@ class ContextStore:
     def build_system_context(self) -> str:
         """
         Compile a system-prompt context block from the database.
-        Includes: recent interaction history + latest cwd snapshot.
+        Includes: CLAUDE.md (if exists) + latest interaction history + cwd snapshot.
         """
         snap = self.snapshot_cwd()
         history = self.recent_history(limit=15)
+        
+        # Load project-level instructions (Claude Code Style)
+        claude_md = ""
+        claude_path = Path("CLAUDE.md")
+        if claude_path.exists():
+            try:
+                claude_md = f"\n## PROJECT_CONTEXT (CLAUDE.md)\n{claude_path.read_text()}\n"
+            except: pass
 
         ctx_parts = [
-            "## LAMCAP — Context Snapshot",
-            f"Timestamp: {datetime.now(timezone.utc).isoformat()}",
-            f"Working directory: {snap['cwd']}",
-            f"Files in tree ({len(snap['files'])} shown): {json.dumps(snap['files'][:60])}",
-            "",
-            "## Recent Interaction History",
+            "## LAMCAP Engine — Runtime Context",
+            f"Current Time: {datetime.now(timezone.utc).isoformat()}",
+            f"Working Directory: {snap['cwd']}",
+            f"File Tree Snapshot: {json.dumps(snap['files'][:60])}",
+            claude_md,
+            "## Interaction History (Memory)",
         ]
 
         for row in history:
             if row.get("prompt"):
                 ctx_parts.append(f"[user] {row['prompt']}")
             if row.get("plan_json"):
-                ctx_parts.append(f"[planner] {row['plan_json'][:300]}")
+                ctx_parts.append(f"[assistant thoughts] {row['plan_json']}")
             if row.get("command"):
                 exit_code = row.get("exit_code", "?")
-                ctx_parts.append(f"[executor] $ {row['command']}  (exit {exit_code})")
+                ctx_parts.append(f"[system_action] $ {row['command']} (exit {exit_code})")
                 if row.get("stdout"):
-                    ctx_parts.append(f"  stdout: {row['stdout'][:200]}")
+                    ctx_parts.append(f"  Result: {row['stdout'][:500]}")
                 if row.get("stderr"):
-                    ctx_parts.append(f"  stderr: {row['stderr'][:200]}")
+                    ctx_parts.append(f"  Error: {row['stderr'][:500]}")
 
         return "\n".join(ctx_parts)
 
@@ -506,33 +514,30 @@ class AuthManager:
 
 # ── 3a. Planner Agent ─────────────────────────────────────────────────────
 
-class PlannerAgent:
-    """
-    Takes a raw user prompt plus SQLite context and asks the LLM to return
-    a JSON-structured list of concrete terminal sub-tasks.
-
-    Expected output schema from the LLM:
-        {
-          "tasks": [
-            {"step": 1, "command": "...", "description": "..."},
-            ...
-          ]
-        }
-    """
-
     PLANNER_INSTRUCTIONS = textwrap.dedent("""\
-        You are the LAMCAP Planner Agent. Your purpose is to decompose the
-        user's intent into a list of concrete terminal commands that can be
-        executed sequentially in a Linux / Termux shell.
-
+        You are the LAMCAP Agent. You operate in a recursive Plan-Act-Observe loop.
+        
+        GOAL: Accomplish the user's task using the provided terminal environment.
+        
         RULES:
-        1. FIRST, wrap your thinking and logic inside a <thought>...</thought> block. Tell the user what you are planning to do natively.
-        2. THEN, return ONLY valid JSON — no markdown fences, no commentary outside the thought block.
-        3. Use the exact schema:
-           {"tasks": [{"step": <int>, "command": "<shell command>", "description": "<why>"}]}
-        4. Each command must be a single, self-contained shell invocation.
-        5. Prefer non-destructive, idempotent commands when possible.
-        6. Use the file-system context and history provided to avoid redundant work.
+        1. FIRST, wrap your thinking and logic inside a <thought>...</thought> block. 
+        2. Analyze the current state, file tree, and history before deciding the next move.
+        3. If you need to run a command, return a JSON block with "action": "run" and "command": "<cmd>".
+        4. If the task is fully complete, return "status": "FINISHED" and a summary of what you did.
+        5. DO NOT provide multiple commands. Return ONLY ONE action per turn.
+        6. Wait for the system's "Observation" (stdout/stderr) before planning the next step.
+        
+        JSON SCHEMA:
+        {
+          "action": "run",
+          "command": "ls -la",
+          "description": "Scanning directory to see current state."
+        }
+        OR
+        {
+          "status": "FINISHED",
+          "summary": "Created the file and verified it exists."
+        }
     """)
 
     def __init__(self, engine: InferenceEngine, store: ContextStore) -> None:
@@ -541,10 +546,7 @@ class PlannerAgent:
 
     def plan(self, user_prompt: str) -> dict:
         """
-        Generate a structured execution plan for *user_prompt*.
-
-        Returns:
-            A dict with a "tasks" key containing a list of step dicts.
+        Produce a single iterative reasoning step.
         """
         from rich.live import Live
         from rich.markdown import Markdown
@@ -568,15 +570,10 @@ class PlannerAgent:
         try:
             plan = json.loads(cleaned)
         except json.JSONDecodeError:
-            # Fallback: wrap any plain-text answer into a single echo task
+            # Fallback: Just display the text and end the loop
             plan = {
-                "tasks": [
-                    {
-                        "step": 1,
-                        "command": f'echo "{cleaned[:200]}"',
-                        "description": "LLM returned non-JSON; echoing raw response.",
-                    }
-                ]
+                "status": "FINISHED",
+                "summary": cleaned
             }
 
         self.store.log_plan(json.dumps(plan))
@@ -942,67 +939,76 @@ def print_history(store: ContextStore) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_agent_pipeline(prompt: str, engine: BaseEngine, store: ContextStore, planner: PlannerAgent, validator: ValidatorAgent, executor: ExecutorAgent) -> None:
-    """Execute the full Planner → Validator → Executor pipeline."""
-    store.log_user_prompt(prompt, engine.model, engine.multiplier)
+    """The Recursive Plan-Act-Observe Loop."""
     
-    start_time = time.time()
+    current_prompt = prompt
+    iteration = 0
+    max_iterations = 15 # Safety cap
     
-    # 1. PLANNER STAGE
-    try:
-        plan = planner.plan(prompt)
-    except Exception as exc:
-        console.print(f"[bold red]✗ Error:[/bold red] {exc}\n")
-        return
+    # Permission Mode: 
+    # Use global setting or default to "NORMAL" (ask for every write/execute)
+    mode = store.get_setting("execution_mode", "NORMAL")
+    
+    while iteration < max_iterations:
+        iteration += 1
         
-    calc_time = round(time.time() - start_time, 2)
-    # Give a fake but robust-looking token estimation based on prompt & context sizing
-    est_tokens = len(prompt) // 4 + 190
-    
-    console.print(f"[dim]✓ Reasoning complete: ~{est_tokens} context tokens processed in {calc_time}s[/dim]")
-
-    tasks = plan.get("tasks", [])
-    if not tasks: 
-        console.print("[dim]No actionable shell task generated.[/dim]\n")
-        return
-
-    plan_table = Table(box=box.MINIMAL_DOUBLE_HEAD, show_header=True, expand=True)
-    plan_table.add_column("Step", style="bold cyan", width=5)
-    plan_table.add_column("Command", style="bold yellow")
-    plan_table.add_column("Description", style="dim white")
-    for t in tasks: plan_table.add_row(str(t.get("step")), t.get("command"), t.get("description"))
-    
-    console.print("\n[bold purple]⟡ Proposed Action Plan[/bold purple]")
-    console.print(plan_table)
-
-    # 2. VALIDATOR STAGE
-    with console.status("[bold purple]⟡ Validator[/bold purple] [dim]verifying safety parameters…[/dim]", spinner="aesthetic"):
-        approved, blocked = validator.validate(plan)
-        time.sleep(0.3)  # Give the security scan a premium feeling
-        
-    if blocked:
-        for b in blocked: console.print(f"    [red]✗ Security Intercept:[/red] {b.get('command')}")
-    if not approved: 
-        console.print("[dim]Pipeline aborted due to strict security protocols.[/dim]\n")
-        return
-
-    # 3. INTERACTIVE APPROVAL
-    confirm = console.input("\n[bold purple]?[/bold purple] [white]Execute this plan?[/white] [dim](Y/n)[/dim] ").strip().lower()
-    if confirm in ("n", "no", "q"):
-        console.print("[dim]✗ Execution gracefully aborted by user.[/dim]\n")
-        return
-
-    # 4. EXECUTOR STAGE
-    console.print("\n[bold purple]⟡ Executor[/bold purple] [dim]running commands natively…[/dim]")
-    for task in approved:
-        console.print(f"  [bold cyan]Step {task.get('step')}:[/bold cyan] [italic]{task.get('command')}[/italic]")
-        
-        with console.status(f"  [dim]Executing background process...[/dim]", spinner="dots"):
-            result = executor.execute(task)
+        # 1. THINK & DECIDE NEXT STEP
+        try:
+            # We don't log the prompt every time, or we might bloat. 
+            # We provide the full context to the planner.
+            step_plan = planner.plan(current_prompt if iteration == 1 else "Continue based on history.")
+        except Exception as exc:
+            console.print(f"[bold red]✗ Agent Error:[/bold red] {exc}\n")
+            break
             
-        if result.get("stdout"): console.print(f"    [dim]{result['stdout'][:1500]}[/dim]")
-        if result.get("stderr"): console.print(f"    [red]{result['stderr'][:1000]}[/red]")
+        # 2. STATUS CHECK
+        if step_plan.get("status") == "FINISHED":
+            console.print(f"\n[bold green]✓ Task Complete:[/bold green] {step_plan.get('summary')}\n")
+            break
+            
+        action_cmd = step_plan.get("command")
+        if not action_cmd:
+            console.print("[dim]Agent provided no command and didn't finish. Aborting loop.[/dim]")
+            break
+            
+        # 3. VALIDATION & SECURITY
+        # Create a temporary 'tasks' structure for the existing validator
+        temp_plan = {"tasks": [step_plan]}
+        approved, blocked = validator.validate(temp_plan)
         
-    console.print("[bold green]✓ Pipeline completed.[/bold green]\n")
+        if blocked:
+            console.print(f"  [red]✗ Security Blocked:[/red] {action_cmd}")
+            break
+
+        # 4. INTERACTIVE APPROVAL (if in NORMAL mode)
+        if mode == "NORMAL":
+            confirm = console.input(f"\n  [bold yellow]?[/bold yellow] Allow command: [italic]{action_cmd}[/italic]? [dim](y/N)[/dim] ").strip().lower()
+            if confirm != 'y':
+                console.print("[dim]✗ Execution cancelled by user.[/dim]")
+                break
+
+        # 5. EXECUTION & OBSERVATION
+        console.print(f"  [bold purple]Executing:[/bold purple] [dim]{action_cmd}[/dim]")
+        with console.status("[dim]Working...[/dim]", spinner="dots"):
+            result = executor.execute(step_plan)
+            
+        # Feedback the observation to the context store
+        store.log_execution(action_cmd, result.get("stdout", ""), result.get("stderr", ""), result.get("exit_code", 0))
+        
+        # Show a snippet of output
+        if result.get("stdout"): 
+            snippet = result['stdout'][:300] + ("..." if len(result['stdout']) > 300 else "")
+            console.print(f"    [dim]{snippet}[/dim]")
+        if result.get("stderr"):
+            console.print(f"    [red]{result['stderr'][:500]}[/red]")
+            
+        # The prompt for the NEXT iteration is just a nudge to look at the new history
+        current_prompt = "See latest command result in history."
+
+    if iteration >= max_iterations:
+        console.print("[yellow]! Safety cap reached. The agent was loops for too long.[/yellow]")
+    
+    console.print("[bold purple]⟡ Session Closed.[/bold purple]\n")
 
 
 def main() -> None:
