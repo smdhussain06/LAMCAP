@@ -52,27 +52,18 @@ Tap **Allow** when prompted. This lets LAMCAP access `~/storage/shared/` (your p
 
 ---
 
-### Step 5 — Clone the repository
+### Step 5 — Quick Install (Single Run Command)
+
+You can install LAMCAP directly into your system as a global command!
 
 ```bash
-git clone https://github.com/smdhussain06/LAMCAP.git
-cd LAMCAP
+pip install git+https://github.com/smdhussain06/LAMCAP.git
 ```
+
 
 ---
 
-### Step 6 — Install Python dependencies
 
-```bash
-pip install -r requirements.txt
-```
-
-This installs:
-- `anthropic` — inference client (routed to your local proxy)
-- `rich` — premium terminal UI
-- `prompt_toolkit` — interactive REPL with history
-
----
 
 ### Step 7 — Set up your environment variables
 

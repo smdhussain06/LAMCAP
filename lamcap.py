@@ -79,6 +79,13 @@ except ImportError:
 
 VERSION = "0.1.0"
 
+LAMCAP_LOGO = r"""[bold purple]
+  _      ___  __  __ ___   _   ___ 
+ | |    / _ \|  \/  | __| /_\ | _ \
+ | |__ | (_) | |\/| | _| / _ \|  _/
+ |____| \___/|_|  |_|___/_/ \_\_|  
+[/bold purple]"""
+
 # Where the SQLite database lives (next to this script or in cwd)
 DB_PATH = os.path.join(os.getcwd(), "lamcap.db")
 
@@ -152,6 +159,18 @@ class ContextStore:
             ts          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
             cwd         TEXT    NOT NULL,
             tree_json   TEXT    NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key         TEXT PRIMARY KEY,
+            value       TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS memory (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            type        TEXT    NOT NULL,
+            content     TEXT    NOT NULL,
+            ts          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
         );
     """)
 
@@ -270,6 +289,43 @@ class ContextStore:
 
         return "\n".join(ctx_parts)
 
+    # ── Settings & Memory helpers ─────────────────────────────────────────
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        """Retrieve a persistent setting from the database."""
+        row = self.conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Persist a setting to the database."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        self.conn.commit()
+
+    def add_memory(self, type_str: str, content: str) -> int:
+        """Add a persistent memory / context block."""
+        cur = self.conn.execute(
+            "INSERT INTO memory (type, content) VALUES (?, ?)",
+            (type_str, content),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def list_memory(self, type_str: str | None = None) -> list[dict]:
+        """List persistent memories, optionally filtered by type."""
+        if type_str:
+            rows = self.conn.execute("SELECT * FROM memory WHERE type = ? ORDER BY id DESC", (type_str,)).fetchall()
+        else:
+            rows = self.conn.execute("SELECT * FROM memory ORDER BY id DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_memory(self, mem_id: int) -> None:
+        """Remove a memory entry by ID."""
+        self.conn.execute("DELETE FROM memory WHERE id = ?", (mem_id,))
+        self.conn.commit()
+
     def close(self) -> None:
         self.conn.close()
 
@@ -296,49 +352,29 @@ def check_bridge_connection(url: str, timeout: float = 1.0) -> bool:
     except (socket.timeout, ConnectionRefusedError, OSError):
         return False
 
-class InferenceEngine:
-    """
-    Anthropic-compatible client that routes ALL traffic through a local
-    Copilot-to-LAMCAP proxy (default: localhost:4141).
+class BaseEngine:
+    """Base class for all LAMCAP inference engines."""
+    def __init__(self, model: str):
+        self.model = model
+        self.multiplier = MODEL_MULTIPLIER_MAP.get(model, 0.0)
 
-    Environment variables control every tuneable:
-      ANTHROPIC_BASE_URL  → proxy endpoint
-      ANTHROPIC_API_KEY   → bearer token / passthrough
-      ANTHROPIC_MODEL     → model trigger string
-    """
+    def infer(self, system_prompt: str, user_message: str, max_tokens: int = 4096) -> str:
+        raise NotImplementedError
 
+class CloudEngine(BaseEngine):
+    """Anthropic-compatible client routed through the local bridge."""
     def __init__(
         self,
         base_url: str = ANTHROPIC_BASE_URL,
         api_key: str = ANTHROPIC_API_KEY,
         model: str = ANTHROPIC_MODEL,
-    ) -> None:
+    ):
+        super().__init__(model)
         self.base_url = base_url
         self.api_key = api_key
-        self.model = model
-        self.multiplier = MODEL_MULTIPLIER_MAP.get(model, 0.0)
-
-        # Build the Anthropic client pointed at the local proxy
-        self.client = anthropic.Anthropic(
-            base_url=self.base_url,
-            api_key=self.api_key,
-        )
+        self.client = anthropic.Anthropic(base_url=self.base_url, api_key=self.api_key)
 
     def infer(self, system_prompt: str, user_message: str, max_tokens: int = 4096) -> str:
-        """
-        Send a single-turn inference request through the proxy bridge.
-
-        Args:
-            system_prompt: Compiled context from the SQLite layer.
-            user_message:  The user's natural-language intent.
-            max_tokens:    Response length cap.
-
-        Returns:
-            The assistant's text response.
-
-        Raises:
-            ConnectionError: If the proxy is unreachable.
-        """
         try:
             response = self.client.messages.create(
                 model=self.model,
@@ -346,23 +382,100 @@ class InferenceEngine:
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_message}],
             )
-            # Extract text from content blocks
-            text_blocks = [
-                block.text for block in response.content if hasattr(block, "text")
-            ]
-            return "\n".join(text_blocks)
+            return "\n".join([b.text for b in response.content if hasattr(b, "text")])
+        except anthropic.APIConnectionError:
+            raise ConnectionError(f"[LAMCAP] Proxy unreachable at {self.base_url}")
+        except Exception as e:
+            raise ConnectionError(f"[LAMCAP] Cloud inference error: {e}")
 
-        except anthropic.APIConnectionError as exc:
-            raise ConnectionError(
-                f"[LAMCAP] Proxy bridge unreachable at {self.base_url}\n"
-                f"  → Ensure your Copilot-to-LAMCAP tunnel is running.\n"
-                f"  → Detail: {exc}"
-            ) from exc
-        except anthropic.APIStatusError as exc:
-            raise ConnectionError(
-                f"[LAMCAP] Proxy returned an error (HTTP {exc.status_code}).\n"
-                f"  → {exc.message}"
-            ) from exc
+class LocalEngine(BaseEngine):
+    """Local inference engine using Ollama on localhost:11434."""
+    def __init__(self, model: str, host: str = "http://localhost:11434"):
+        super().__init__(model)
+        self.host = host
+
+    def infer(self, system_prompt: str, user_message: str, max_tokens: int = 4096) -> str:
+        import urllib.request
+        import json
+        url = f"{self.host}/api/chat"
+        data = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            "stream": False,
+            "options": {"num_predict": max_tokens}
+        }
+        try:
+            req = urllib.request.Request(
+                url, data=json.dumps(data).encode("utf-8"), headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=60) as res:
+                body = json.loads(res.read().decode("utf-8"))
+                return body.get("message", {}).get("content", "")
+        except Exception as e:
+            raise ConnectionError(f"[LAMCAP] Local Ollama error: {e}")
+
+class InferenceEngine:
+    """Factory that returns the appropriate engine based on model prefix."""
+    def __new__(cls, model: str | None = None, **kwargs) -> BaseEngine:
+        model = model or os.environ.get("ANTHROPIC_MODEL", "gpt-4.1")
+        # If model is an Ollama model, use LocalEngine. 
+        # For simplicity, we assume models NOT in MODEL_MULTIPLIER_MAP are local unless specified.
+        if model not in MODEL_MULTIPLIER_MAP:
+            return LocalEngine(model=model)
+        return CloudEngine(model=model)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2b. AUTHENTICATION — GitHub Device Flow (8-digit OTP)
+# ══════════════════════════════════════════════════════════════════════════════
+
+import requests
+
+class AuthManager:
+    """Handles GitHub Device Flow authentication."""
+    CLIENT_ID = "Iv1.b507a73f8430e3fd"  # Placeholder or generic LAMCAP ID
+
+    @classmethod
+    def start_device_flow(cls) -> dict:
+        """Request device code and user code from GitHub."""
+        try:
+            res = requests.post(
+                "https://github.com/login/device/code",
+                data={"client_id": cls.CLIENT_ID, "scope": "repo,gist,user"},
+                headers={"Accept": "application/json"},
+                timeout=10
+            )
+            return res.json()
+        except Exception as e:
+            return {"error": str(e)}
+
+    @classmethod
+    def poll_for_token(cls, device_code: str, interval: int = 5) -> str | None:
+        """Poll GitHub for the access token."""
+        start_time = time.time()
+        while time.time() - start_time < 900:  # 15 min expires
+            try:
+                res = requests.post(
+                    "https://github.com/login/oauth/access_token",
+                    data={
+                        "client_id": cls.CLIENT_ID,
+                        "device_code": device_code,
+                        "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
+                    },
+                    headers={"Accept": "application/json"},
+                    timeout=10
+                )
+                data = res.json()
+                if "access_token" in data:
+                    return data["access_token"]
+                if data.get("error") != "authorization_pending":
+                    return None
+            except:
+                pass
+            time.sleep(interval)
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -554,78 +667,203 @@ def format_multiplier(multiplier: float) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5.  EXECUTION INTERFACE & UI — Rich Splash + prompt_toolkit REPL
+# 5.  UI COMPONENTS — Splash, Tables & Menus
 # ══════════════════════════════════════════════════════════════════════════════
 
-LAMCAP_LOGO = """\
-[bold purple]
-██       ████   ███ ███  █████   ████   █████ 
-██      ██  ██  ███████ ██      ██  ██  ██  ██
-██      ██████  ██ █ ██ ██      ██████  █████ 
-██      ██  ██  ██   ██ ██      ██  ██  ██    
-███████ ██  ██  ██   ██  █████  ██  ██  ██    
-[/bold purple]"""
+class MenuManager:
+    """Handles the top-level LAMCAP menu and its sub-sections."""
 
+    @staticmethod
+    def show_home(store: ContextStore, is_connected: bool) -> str:
+        """Display the primary dashboard/menu."""
+        os.system("clear")
+        console.print(Panel("[bold purple]LAMCAP[/bold purple] Automation Engine", style="purple", box=box.DOUBLE_EDGE, expand=True))
+        console.print(LAMCAP_LOGO, justify="center")
+        
+        status_color = "green" if is_connected else "red"
+        status_text = "Connected" if is_connected else "Disconnected"
+        
+        trigger = store.get_setting("trigger_name", "LAMCAP")
+        
+        console.print(Panel(
+            f"  [bold]• Status:[/bold]      [{status_color}]{status_text}[/{status_color}]\n"
+            f"  [bold]• Trigger:[/bold]     [purple]{trigger}[/purple]\n"
+            f"  [bold]• Directory:[/bold]   [dim]{os.getcwd()}[/dim]",
+            title="System Snapshot", box=box.ROUNDED, expand=True
+        ))
+
+        menu_items = (
+            "[bold white]1) [purple]Cloud[/purple][/bold white]           — Claude/GPT/Gemini Bridge\n"
+            "[bold white]2) [purple]Local[/purple][/bold white]           — Ollama (Offline Mode)\n"
+            "[bold white]3) [purple]Authentication[/purple][/bold white]  — GitHub Link (8-digit OTP)\n"
+            "[bold white]4) [purple]Settings[/purple][/bold white]        — Triggers & Context Memory\n"
+            "[bold white]5) [purple]REPL[/purple][/bold white]            — Enter the Agent Shell\n"
+            "[bold white]0) [purple]Exit[/purple][/bold white]"
+        )
+        console.print(Panel(menu_items, title="Main Menu", border_style="dim", expand=True))
+        
+        try:
+            choice = console.input("\n[bold purple]lamcap> [/bold purple]").strip()
+            return choice
+        except (KeyboardInterrupt, EOFError):
+            return "0"
+
+    @staticmethod
+    def show_cloud() -> str | None:
+        """Menu to select cloud models."""
+        table = Table(title="Claude Code Models (Copilot Bridge)", box=box.SIMPLE_HEAVY, expand=True)
+        table.add_column("ID", style="bold", width=4)
+        table.add_column("Model Trigger", style="purple")
+        table.add_column("Multiplier", justify="right")
+        
+        models = [
+            ("1", "gpt-4.1", "0x"),
+            ("2", "gpt-4o", "0x"),
+            ("3", "grok-code-fast-1", "0.25x"),
+            ("4", "claude-haiku-4.5", "0.33x"),
+            ("5", "gemini-3-flash-preview", "0.33x"),
+            ("6", "gemini-3.1-pro-preview", "1x"),
+        ]
+        for m in models:
+            table.add_row(*m)
+        
+        console.print(table)
+        try:
+            choice = console.input("\n[bold purple]Select Model ID (or 'b' to go back): [/bold purple]").strip()
+            if choice.lower() == 'b': return None
+            idx = int(choice) - 1 if choice.isdigit() and 0 < int(choice) <= len(models) else None
+            return models[idx][1] if idx is not None else None
+        except:
+            return None
+
+    @staticmethod
+    def show_local() -> str | None:
+        """Ollama model manager."""
+        console.print("\n[bold]Checking local Ollama models...[/bold]")
+        try:
+            res = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=5)
+            if res.returncode == 0:
+                console.print(res.stdout)
+            else:
+                raise Exception("Ollama not responding")
+        except:
+            console.print("[yellow]Ollama not detected or not running.[/yellow]")
+            console.print("\n[bold white]Suggested for LAMCAP workflow:[/bold white]")
+            console.print("  • llama3 (8b)  — General purpose")
+            console.print("  • mistral     — Fast, high instructions")
+            console.print("  • phi3        — Lightweight for mobile")
+            
+        try:
+            choice = console.input("\n[bold purple]Enter model name to use (or 'pull <name>' to install): [/bold purple]").strip()
+            if not choice: return None
+            if choice.startswith("pull "):
+                model_to_pull = choice.replace("pull ", "")
+                console.print(f"Installing {model_to_pull} via Ollama...")
+                subprocess.run(["ollama", "pull", model_to_pull])
+                return model_to_pull
+            return choice
+        except:
+            return None
+
+    @staticmethod
+    def show_auth(store: ContextStore) -> None:
+        """8-digit OTP GitHub flow."""
+        console.print("\n[bold purple]GitHub Authentication — Link Proxy / LAMCAP Bridge[/bold purple]")
+        data = AuthManager.start_device_flow()
+        if "error" in data:
+            console.print(f"[red]Error:[/red] {data.get('error')}")
+            console.print("[dim]Press Enter to return.[/dim]")
+            try: console.input()
+            except: pass
+            return
+
+        user_code = data.get('user_code', 'ERROR')
+        uri = data.get('verification_uri', 'https://github.com/login/device')
+        
+        console.print(Panel(
+            f"1. Open: [link={uri}]{uri}[/link]\n"
+            f"2. Enter Code: [bold cyan]{user_code}[/bold cyan]\n"
+            "\n[dim italic]Waiting for authorization...[/dim italic]",
+            title="GitHub Identity Link", border_style="purple", expand=True
+        ))
+        
+        token = AuthManager.poll_for_token(data.get('device_code', ''), data.get('interval', 5))
+        if token:
+            store.set_setting("gh_token", token)
+            console.print("\n[bold green]✓ Successfully authenticated![/bold green]")
+        else:
+            console.print("\n[red]✗ Authentication failed or timed out.[/red]")
+        
+        try: console.input("\n[dim]Press Enter to continue...[/dim]")
+        except: pass
+
+    @staticmethod
+    def show_settings(store: ContextStore) -> None:
+        """Trigger & Memory management."""
+        while True:
+            os.system("clear")
+            current_trigger = store.get_setting("trigger_name", "LAMCAP")
+            
+            console.print(Panel(
+                f"[bold white]1. Update Trigger:[/bold white] Currently '[purple]{current_trigger}[/purple]'\n"
+                f"[bold white]2. Add Prompt Memory:[/bold white] inject persistent context\n"
+                f"[bold white]3. List/Clear Memory:[/bold white]\n"
+                f"[bold white]0. Go Back[/bold white]",
+                title="Settings & Context Memory", expand=True
+            ))
+            
+            try:
+                sub = console.input("\n[bold purple]settings> [/bold purple]").strip()
+                if sub == "1":
+                    new_t = console.input("New trigger name: ").strip()
+                    if new_t: store.set_setting("trigger_name", new_t)
+                elif sub == "2":
+                    content = console.input("Enter natural text prompt for memory:\n")
+                    if content: store.add_memory("prompt", content)
+                elif sub == "3":
+                    mems = store.list_memory()
+                    if not mems:
+                        console.print("  [dim]No memory entries found.[/dim]")
+                    for m in mems:
+                        console.print(f"  [{m['id']}] ({m['ts']}) [dim]{m['content'][:60]}...[/dim]")
+                    cid = console.input("\nEnter ID to delete (or Enter for none): ").strip()
+                    if cid.isdigit(): store.delete_memory(int(cid))
+                elif sub == "0":
+                    break
+            except (KeyboardInterrupt, EOFError):
+                break
 
 def render_splash(model: str, multiplier: float, is_connected: bool) -> None:
-    """
-    Clear the terminal and paint a premium LAMCAP splash screen using Rich.
-    """
+    """Clear the terminal and paint a premium LAMCAP splash screen."""
     os.system("clear")
-
-    # ── Top welcome panel ─────────────────────────────────────────────────
-    console.print(
-        Panel(
-            "[dim]❖ Welcome to the [bold white]LAMCAP[/bold white] terminal environment![/dim]",
-            style="purple",
-            box=box.DOUBLE_EDGE,
-            expand=True,
-        )
-    )
-
-    # ── Block-text logo ───────────────────────────────────────────────────
+    console.print(Panel("[dim]❖ Welcome to the [bold white]LAMCAP[/bold white] terminal environment![/dim]", style="purple", box=box.DOUBLE_EDGE, expand=True))
     console.print(LAMCAP_LOGO, justify="center")
-
-    # ── Status line ───────────────────────────────────────────────────────
+    
     cwd = os.getcwd()
     mult_display = format_multiplier(multiplier)
     model_upper = model.upper().replace("-", "-")
-
-    if is_connected:
-        bridge_status = "[bold green]Bridge connected.[/bold green]"
-    else:
-        bridge_status = "[bold red]Bridge disconnected.[/bold red]"
+    status_str = "[green]Bridge connected.[/green]" if is_connected else "[red]Bridge disconnected.[/red]"
 
     status = (
-        f"{bridge_status}  "
+        f"{status_str}  "
         f"[bold purple]{model_upper}[/bold purple] "
-        f"[dim]({mult_display})[/dim]  "
-        f"[dim]•[/dim]  "
-        f"[dim italic]{cwd}[/dim italic]"
+        f"({mult_display})  •  [dim italic]{cwd}[/dim italic]"
     )
     console.print(Panel(status, style="dim", box=box.ROUNDED, expand=True))
 
-    # ── Quick-help strip ──────────────────────────────────────────────────
     help_items = [
-        "[bold purple]help[/bold purple] — show commands",
-        "[bold purple]status[/bold purple] — bridge info",
-        "[bold purple]history[/bold purple] — past runs",
+        "[bold purple]help[/bold purple] — info",
+        "[bold purple]status[/bold purple] — stats",
+        "[bold purple]history[/bold purple] — runs",
         "[bold purple]exit[/bold purple] — quit",
     ]
-    console.print(
-        Columns(help_items, equal=True, expand=True),
-        style="dim",
-    )
+    console.print(Columns(help_items, equal=True, expand=True), style="dim")
     console.print()
 
 
 def print_help() -> None:
     """Display a list of built-in REPL commands."""
-    table = Table(
-        title="[bold purple]LAMCAP Commands[/bold purple]",
-        box=box.SIMPLE_HEAVY,
-        show_lines=True,
-    )
+    table = Table(title="[bold purple]LAMCAP Commands[/bold purple]", box=box.SIMPLE_HEAVY, show_lines=True)
     table.add_column("Command", style="bold purple", no_wrap=True)
     table.add_column("Description", style="dim")
     table.add_row("help", "Show this help table.")
@@ -635,224 +873,130 @@ def print_help() -> None:
     table.add_row("exit / quit", "Exit LAMCAP.")
     table.add_row("<any text>", "Send a natural-language prompt to the agent pipeline.")
     console.print(table)
-    console.print()
 
 
-def print_status(engine: InferenceEngine) -> None:
+def print_status(engine: BaseEngine) -> None:
     """Print current bridge and model information."""
     mult_display = format_multiplier(engine.multiplier)
     console.print()
-    console.print(f"  [bold purple]Proxy URL:[/bold purple]   {engine.base_url}")
+    if hasattr(engine, "base_url"):
+        console.print(f"  [bold purple]Proxy URL:[/bold purple]   {engine.base_url}")
     console.print(f"  [bold purple]Model:[/bold purple]       {engine.model}")
     console.print(f"  [bold purple]Multiplier:[/bold purple]  {mult_display}")
-    console.print(f"  [bold purple]API Key:[/bold purple]     {'*' * max(0, len(engine.api_key) - 4)}{engine.api_key[-4:]}")
     console.print(f"  [bold purple]Database:[/bold purple]    {DB_PATH}")
-    console.print(f"  [bold purple]CWD:[/bold purple]         {os.getcwd()}")
     console.print()
 
 
 def print_history(store: ContextStore) -> None:
-    """Display the most recent history entries in a Rich table."""
+    """Display the most recent history entries."""
     rows = store.recent_history(limit=10)
     if not rows:
         console.print("  [dim]No history yet.[/dim]\n")
         return
-
-    table = Table(
-        title="[bold purple]Recent History[/bold purple]",
-        box=box.MINIMAL_DOUBLE_HEAD,
-        show_lines=True,
-        expand=True,
-    )
+    table = Table(title="[bold purple]Recent History[/bold purple]", box=box.MINIMAL_DOUBLE_HEAD, expand=True)
     table.add_column("#", style="dim", width=4)
     table.add_column("Role", style="bold purple", width=10)
     table.add_column("Content", ratio=1)
     table.add_column("Exit", width=5, justify="center")
-
-    for row in rows:
-        content = row.get("prompt") or row.get("command") or (row.get("plan_json") or "")[:80]
-        exit_code = str(row["exit_code"]) if row.get("exit_code") is not None else ""
-        table.add_row(str(row["id"]), row["role"], content[:120], exit_code)
-
+    for r in rows:
+        content = r.get("prompt") or r.get("command") or (r.get("plan_json") or "")[:80]
+        table.add_row(str(r["id"]), r["role"], content[:120], str(r.get("exit_code", "")))
     console.print(table)
-    console.print()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6.  MAIN REPL LOOP
+# 6.  EXECUTION PIPELINE & REPL
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_agent_pipeline(
-    prompt: str,
-    engine: InferenceEngine,
-    store: ContextStore,
-    planner: PlannerAgent,
-    validator: ValidatorAgent,
-    executor: ExecutorAgent,
-) -> None:
-    """
-    Execute the full Planner → Validator → Executor pipeline for a
-    single user prompt, printing rich output at each stage.
-    """
-    # Log the user prompt
+def run_agent_pipeline(prompt: str, engine: BaseEngine, store: ContextStore, planner: PlannerAgent, validator: ValidatorAgent, executor: ExecutorAgent) -> None:
+    """Execute the full Planner → Validator → Executor pipeline."""
     store.log_user_prompt(prompt, engine.model, engine.multiplier)
-
-    # ── Stage 1: Planning ─────────────────────────────────────────────────
-    console.print()
-    console.print("[bold purple]⟡ Planner[/bold purple]  [dim]decomposing intent…[/dim]")
+    console.print("\n[bold purple]⟡ Planner[/bold purple] [dim]decomposing intent…[/dim]")
     try:
         plan = planner.plan(prompt)
-    except ConnectionError as exc:
-        console.print(f"[bold red]✗ Bridge Error:[/bold red] {exc}\n")
-        return
     except Exception as exc:
-        console.print(f"[bold red]✗ Planner Error:[/bold red] {exc}\n")
+        console.print(f"[bold red]✗ Error:[/bold red] {exc}\n")
         return
 
     tasks = plan.get("tasks", [])
-    if not tasks:
-        console.print("  [dim]No tasks generated.[/dim]\n")
-        return
+    if not tasks: return
 
-    # Display the plan
     plan_table = Table(box=box.SIMPLE, show_header=True, expand=True)
-    plan_table.add_column("Step", style="bold", width=5, justify="center")
+    plan_table.add_column("Step", style="bold", width=5)
     plan_table.add_column("Command", style="bold purple")
     plan_table.add_column("Description", style="dim")
-    for t in tasks:
-        plan_table.add_row(str(t.get("step", "?")), t.get("command", ""), t.get("description", ""))
+    for t in tasks: plan_table.add_row(str(t.get("step")), t.get("command"), t.get("description"))
     console.print(plan_table)
 
-    # ── Stage 2: Validation ───────────────────────────────────────────────
-    console.print("[bold purple]⟡ Validator[/bold purple]  [dim]scanning for destructive patterns…[/dim]")
+    console.print("[bold purple]⟡ Validator[/bold purple] [dim]scanning for safety…[/dim]")
     approved, blocked = validator.validate(plan)
-
     if blocked:
-        console.print(f"  [bold red]⚠ BLOCKED {len(blocked)} task(s):[/bold red]")
-        for b in blocked:
-            console.print(f"    [red]✗ Step {b.get('step')}: {b.get('command')}[/red]")
-            console.print(f"      [dim]{b.get('block_reason')}[/dim]")
-        console.print()
+        for b in blocked: console.print(f"    [red]✗ Blocked:[/red] {b.get('command')}")
+    if not approved: return
 
-    if not approved:
-        console.print("  [yellow]No tasks approved for execution.[/yellow]\n")
-        return
-
-    console.print(f"  [green]✓ {len(approved)} task(s) approved.[/green]")
-
-    # ── Stage 3: Execution ────────────────────────────────────────────────
-    console.print("[bold purple]⟡ Executor[/bold purple]  [dim]running commands…[/dim]")
-    console.print()
-
+    console.print("[bold purple]⟡ Executor[/bold purple] [dim]running commands…[/dim]")
     for task in approved:
-        step = task.get("step", "?")
-        cmd = task.get("command", "")
-        console.print(f"  [bold purple]Step {step}:[/bold purple] [italic]{cmd}[/italic]")
-
+        console.print(f"  [bold purple]Step {task.get('step')}:[/bold purple] [italic]{task.get('command')}[/italic]")
         result = executor.execute(task)
-        exit_code = result.get("exit_code", -1)
-
-        if result.get("stdout"):
-            for line in result["stdout"].rstrip().split("\n")[:30]:
-                console.print(f"    {line}")
-
-        if result.get("stderr"):
-            for line in result["stderr"].rstrip().split("\n")[:15]:
-                console.print(f"    [red]{line}[/red]")
-
-        if exit_code == 0:
-            console.print(f"    [green]✓ exit {exit_code}[/green]")
-        else:
-            console.print(f"    [red]✗ exit {exit_code}[/red]")
-        console.print()
-
+        if result.get("stdout"): console.print(f"    [dim]{result['stdout'][:500]}[/dim]")
+        if result.get("stderr"): console.print(f"    [red]{result['stderr'][:500]}[/red]")
     console.print("[bold purple]⟡ Pipeline complete.[/bold purple]\n")
 
 
 def main() -> None:
-    """
-    Entry point: render the splash screen, initialise all layers,
-    then drop into the interactive REPL loop.
-    """
-    # ── Resolve model + multiplier ────────────────────────────────────────
-    model, multiplier = resolve_model_info()
-
-    # ── Check connection status ───────────────────────────────────────────
-    is_connected = check_bridge_connection(ANTHROPIC_BASE_URL)
-
-    # ── Render splash screen ──────────────────────────────────────────────
-    render_splash(model, multiplier, is_connected)
-
-    # ── Initialise core layers ────────────────────────────────────────────
+    """Main execution loop with Menu transition to REPL."""
     store = ContextStore()
+    model = store.get_setting("last_model", ANTHROPIC_MODEL)
+    
+    while True:
+        is_connected = check_bridge_connection(ANTHROPIC_BASE_URL)
+        choice = MenuManager.show_home(store, is_connected)
+        
+        if choice == "1":
+            m = MenuManager.show_cloud()
+            if m: store.set_setting("last_model", m); model = m
+        elif choice == "2":
+            m = MenuManager.show_local()
+            if m: store.set_setting("last_model", m); model = m
+        elif choice == "3":
+            MenuManager.show_auth(store)
+        elif choice == "4":
+            MenuManager.show_settings(store)
+        elif choice == "5":
+            break
+        elif choice == "0":
+            console.print("Goodbye. ✦")
+            return
+
+    multiplier = MODEL_MULTIPLIER_MAP.get(model, 0.0)
+    render_splash(model, multiplier, is_connected)
+    
     engine = InferenceEngine(model=model)
-    planner = PlannerAgent(engine=engine, store=store)
+    planner = PlannerAgent(engine, store)
     validator = ValidatorAgent()
-    executor = ExecutorAgent(store=store)
+    executor = ExecutorAgent(store)
 
-    # ── Prompt Toolkit session with persistent history ────────────────────
-    ptk_style = PTKStyle.from_dict(
-        {
-            "prompt": "bold purple",
-        }
-    )
-    session: PromptSession = PromptSession(
-        history=FileHistory(REPL_HISTORY_PATH),
-        style=ptk_style,
-    )
+    trigger_name = store.get_setting("trigger_name", "LAMCAP")
+    session = PromptSession(history=FileHistory(REPL_HISTORY_PATH))
 
-    # ── REPL loop ─────────────────────────────────────────────────────────
-    try:
-        while True:
-            try:
-                user_input = session.prompt(
-                    HTML("<b><purple>lamcap&gt; </purple></b>")
-                ).strip()
-            except KeyboardInterrupt:
-                console.print("\n[dim]Ctrl-C pressed. Type 'exit' to quit.[/dim]")
-                continue
-            except EOFError:
-                break
-
-            if not user_input:
-                continue
-
+    while True:
+        try:
+            prompt_html = f"<b><ansipurple>{trigger_name.lower()}&gt; </ansipurple></b>"
+            user_input = session.prompt(HTML(prompt_html)).strip()
+            if not user_input: continue
+            
             lowered = user_input.lower()
-
-            # ── Built-in commands ─────────────────────────────────────────
-            if lowered in ("exit", "quit"):
-                console.print("[bold purple]Goodbye.[/bold purple] ✦\n")
-                break
-
-            if lowered == "help":
-                print_help()
-                continue
-
-            if lowered == "status":
-                print_status(engine)
-                continue
-
-            if lowered == "history":
-                print_history(store)
-                continue
-
-            if lowered == "clear":
-                os.system("clear")
-                continue
-
-            # ── Agent pipeline ────────────────────────────────────────────
-            run_agent_pipeline(
-                prompt=user_input,
-                engine=engine,
-                store=store,
-                planner=planner,
-                validator=validator,
-                executor=executor,
-            )
-
-    finally:
-        store.close()
-
+            if lowered in ("exit", "quit"): break
+            elif lowered == "help": print_help()
+            elif lowered == "status": print_status(engine)
+            elif lowered == "history": print_history(store)
+            elif lowered == "clear": os.system("clear")
+            else: run_agent_pipeline(user_input, engine, store, planner, validator, executor)
+        except (KeyboardInterrupt, EOFError):
+            break
+    
+    store.close()
+    console.print("\nGoodbye. ✦")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 7.  SCRIPT ENTRY
