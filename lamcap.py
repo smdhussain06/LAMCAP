@@ -529,28 +529,30 @@ class PlannerAgent:
     """
 
     PLANNER_INSTRUCTIONS = textwrap.dedent("""\
-        You are the LAMCAP Agent. You operate in a recursive Plan-Act-Observe loop.
+        You are the LAMCAP Agent, a high-level reasoning engine. You operate in a recursive Plan-Act-Observe loop.
         
-        GOAL: Accomplish the user's task using the provided terminal environment.
+        CRITICAL UI REQUIREMENT:
+        1. YOU MUST ALWAYS START with a <thought> block. 
+        2. Inside the <thought> block, explain your reasoning, what you observe, and what you plan to do in a professional, helpful tone.
+        3. DO NOT output code or JSON inside the <thought> block.
+        4. AFTER the </thought> block, output exactly ONE JSON tool call.
+        
+        GOAL: Accomplish the user's task using the terminal.
         
         RULES:
-        1. FIRST, wrap your thinking and logic inside a <thought>...</thought> block. 
-        2. Analyze the current state, file tree, and history before deciding the next move.
-        3. If you need to run a command, return a JSON block with "action": "run" and "command": "<cmd>".
-        4. If the task is fully complete, return "status": "FINISHED" and a summary of what you did.
-        5. DO NOT provide multiple commands. Return ONLY ONE action per turn.
-        6. Wait for the system's "Observation" (stdout/stderr) before planning the next step.
+        - Analyze the current state, file tree, and history before every step.
+        - If you need to run a command, return JSON with "action": "run" and "command": "<cmd>".
+        - If the task is finished, return "status": "FINISHED" and a summary.
+        - NEVER return multiple commands at once. Wait for observation.
         
-        JSON SCHEMA:
+        EXAMPLE OUTPUT:
+        <thought>
+        I see that the project uses Python. I will check the requirements.txt to understand the dependencies.
+        </thought>
         {
           "action": "run",
-          "command": "ls -la",
-          "description": "Scanning directory to see current state."
-        }
-        OR
-        {
-          "status": "FINISHED",
-          "summary": "Created the file and verified it exists."
+          "command": "cat requirements.txt",
+          "description": "Reading dependencies."
         }
     """)
 
@@ -560,7 +562,7 @@ class PlannerAgent:
 
     def plan(self, user_prompt: str) -> dict:
         """
-        Produce a single iterative reasoning step.
+        Produce a single iterative reasoning step with a filtered thought display.
         """
         from rich.live import Live
         from rich.markdown import Markdown
@@ -570,13 +572,20 @@ class PlannerAgent:
         full_system = f"{self.PLANNER_INSTRUCTIONS}\n\n{system_ctx}"
 
         raw = ""
+        display_text = ""
+        
         # Create a dynamic panel that updates live as chunks stream in
-        with Live(Panel(Markdown(""), title="[bold purple]⟡ Planner Thinking...[/bold purple]", border_style="purple"), refresh_per_second=15) as live:
+        with Live(Panel(Markdown(""), title="[bold purple]⟡ Agent Reasoning[/bold purple]", border_style="purple"), refresh_per_second=15) as live:
             for chunk in self.engine.infer(full_system, user_prompt, stream=True):
                 raw += chunk
-                live.update(Panel(Markdown(raw), title="[bold purple]⟡ Planner Thinking...[/bold purple]", border_style="purple"))
+                
+                # Extract thoughts on the fly to show ONLY the human-friendly part
+                thought_match = re.search(r"<thought>(.*?)(?:</thought>|$)", raw, flags=re.DOTALL)
+                if thought_match:
+                    display_text = thought_match.group(1).strip()
+                    live.update(Panel(Markdown(display_text), title="[bold purple]⟡ Agent Reasoning[/bold purple]", border_style="purple"))
 
-        # Clean the output by stripping out the <thought> block
+        # Clean the output by stripping out the <thought> block to get the JSON tool call
         cleaned = re.sub(r"<thought>.*?</thought>", "", raw, flags=re.DOTALL).strip()
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
@@ -584,10 +593,10 @@ class PlannerAgent:
         try:
             plan = json.loads(cleaned)
         except json.JSONDecodeError:
-            # Fallback: Just display the text and end the loop
+            # Fallback: If the model didn't provide JSON, use the raw text as a summary
             plan = {
                 "status": "FINISHED",
-                "summary": cleaned
+                "summary": cleaned or display_text
             }
 
         self.store.log_plan(json.dumps(plan))
