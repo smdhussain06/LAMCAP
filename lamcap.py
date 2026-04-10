@@ -593,11 +593,17 @@ class PlannerAgent:
         try:
             plan = json.loads(cleaned)
         except json.JSONDecodeError:
-            # Fallback: If the model didn't provide JSON, use the raw text as a summary
+            # Fallback: If the model didn't provide JSON (e.g. just a text greeting)
+            # We treat this as a completion step with the text as the summary.
             plan = {
                 "status": "FINISHED",
                 "summary": cleaned or display_text
             }
+
+        # Final safety check: if both action and status are missing, it's a finish.
+        if not plan.get("action") and not plan.get("status"):
+            plan["status"] = "FINISHED"
+            plan["summary"] = cleaned or display_text
 
         self.store.log_plan(json.dumps(plan))
         return plan
@@ -981,14 +987,12 @@ def run_agent_pipeline(prompt: str, engine: BaseEngine, store: ContextStore, pla
             break
             
         # 2. STATUS CHECK
-        if step_plan.get("status") == "FINISHED":
-            console.print(f"\n[bold green]✓ Task Complete:[/bold green] {step_plan.get('summary')}\n")
+        if step_plan.get("status") == "FINISHED" or not step_plan.get("action"):
+            summary = step_plan.get('summary', 'No summary provided.')
+            console.print(f"\n[bold green]✓ Agent:[/bold green] {summary}\n")
             break
             
         action_cmd = step_plan.get("command")
-        if not action_cmd:
-            console.print("[dim]Agent provided no command and didn't finish. Aborting loop.[/dim]")
-            break
             
         # 3. VALIDATION & SECURITY
         temp_plan = {"tasks": [step_plan]}
