@@ -435,7 +435,7 @@ import requests
 
 class AuthManager:
     """Handles GitHub Device Flow authentication."""
-    CLIENT_ID = "Iv1.b507a73f8430e3fd"  # Placeholder or generic LAMCAP ID
+    CLIENT_ID = "Iv1.b507a08c87ecfe98"  # Official Copilot ID
 
     @classmethod
     def start_device_flow(cls) -> dict:
