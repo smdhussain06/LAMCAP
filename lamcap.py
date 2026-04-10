@@ -948,6 +948,8 @@ def main() -> None:
     store = ContextStore()
     model = store.get_setting("last_model", ANTHROPIC_MODEL)
     
+    first_prompt = None
+
     while True:
         is_connected = check_bridge_connection(ANTHROPIC_BASE_URL)
         choice = MenuManager.show_home(store, is_connected)
@@ -967,6 +969,9 @@ def main() -> None:
         elif choice == "0":
             console.print("Goodbye. ✦")
             return
+        elif choice:  # If what they typed is anything else, parse it as a user prompt
+            first_prompt = choice
+            break
 
     multiplier = MODEL_MULTIPLIER_MAP.get(model, 0.0)
     render_splash(model, multiplier, is_connected)
@@ -978,6 +983,9 @@ def main() -> None:
 
     trigger_name = store.get_setting("trigger_name", "LAMCAP")
     session = PromptSession(history=FileHistory(REPL_HISTORY_PATH))
+
+    if first_prompt:
+        run_agent_pipeline(first_prompt, engine, store, planner, validator, executor)
 
     while True:
         try:
