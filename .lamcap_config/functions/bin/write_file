@@ -1,0 +1,13 @@
+#!/bin/bash
+# Tool: write_file
+# Arguments: JSON string with "path" and "content"
+
+JSON_INPUT="$1"
+FILE_PATH=$(echo "$JSON_INPUT" | jq -r '.path')
+CONTENT=$(echo "$JSON_INPUT" | jq -r '.content')
+
+# Ensure directory exists
+mkdir -p "$(dirname "$FILE_PATH")"
+
+echo -n "$CONTENT" > "$FILE_PATH"
+echo "Successfully wrote to $FILE_PATH"

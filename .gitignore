@@ -2,3 +2,9 @@
 /tmp
 /.env
 *.log
+lamcap.db
+.lamcap_history
+__pycache__/
+*.pyc
+venv/
+.venv/

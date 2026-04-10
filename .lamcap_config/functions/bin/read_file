@@ -1,0 +1,12 @@
+#!/bin/bash
+# Tool: read_file
+# Arguments: JSON string with "path"
+
+JSON_INPUT="$1"
+FILE_PATH=$(echo "$JSON_INPUT" | jq -r '.path')
+
+if [ -f "$FILE_PATH" ]; then
+    cat "$FILE_PATH"
+else
+    echo "Error: File not found: $FILE_PATH"
+fi

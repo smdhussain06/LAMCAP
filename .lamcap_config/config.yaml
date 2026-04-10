@@ -1,0 +1,25 @@
+model: github:gpt-4o
+temperature: 0.2
+stream: true
+save: true
+function_calling: true
+
+clients:
+  - type: openai-compatible
+    name: github
+    api_base: https://models.inference.ai.azure.com
+    api_key: ${GITHUB_TOKEN:-}
+    models:
+      - name: gpt-4o
+        max_input_tokens: 128000
+        supports_function_calling: true
+      - name: gpt-4o-mini
+        max_input_tokens: 128000
+        supports_function_calling: true
+      - name: claude-3-5-sonnet
+        max_input_tokens: 128000
+        supports_function_calling: true
+
+highlight: true
+save_session: true
+compress_threshold: 10000

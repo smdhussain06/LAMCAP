@@ -1,0 +1,8 @@
+#!/bin/bash
+# Tool: bash
+# Arguments: JSON string with "command"
+
+JSON_INPUT="$1"
+COMMAND=$(echo "$JSON_INPUT" | jq -r '.command')
+
+eval "$COMMAND"

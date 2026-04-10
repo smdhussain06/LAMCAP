@@ -1,0 +1,9 @@
+#!/bin/bash
+# Tool: grep
+# Arguments: JSON string with "query" and "path"
+
+JSON_INPUT="$1"
+QUERY=$(echo "$JSON_INPUT" | jq -r '.query')
+SEARCH_PATH=$(echo "$JSON_INPUT" | jq -r '.path // "."')
+
+grep -rnE "$QUERY" "$SEARCH_PATH" --exclude-dir=".git" --exclude-dir="target" | head -n 50

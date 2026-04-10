@@ -1,0 +1,13 @@
+#!/bin/bash
+# Tool: ls
+# Arguments: JSON string with "path" and "recursive"
+
+JSON_INPUT="$1"
+PATH_TO_LIST=$(echo "$JSON_INPUT" | jq -r '.path // "."')
+RECURSIVE=$(echo "$JSON_INPUT" | jq -r '.recursive // false')
+
+if [ "$RECURSIVE" = "true" ]; then
+    find "$PATH_TO_LIST" -maxdepth 2 -not -path '*/.*'
+else
+    ls -F "$PATH_TO_LIST"
+fi

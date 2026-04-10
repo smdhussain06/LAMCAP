@@ -1,0 +1,5 @@
+model: github:gpt-4o
+use_tools: null
+instructions: null
+variables:
+  PROJECT_ROOT: .
