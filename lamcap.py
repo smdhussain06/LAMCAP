@@ -7,7 +7,7 @@
 ║  Architecture:                                                             ║
 ║    1. Context Aggregation Layer  — SQLite-backed persistent memory          ║
 ║    2. Multi-Agent Orchestration  — Planner → Validator → Executor          ║
-║    3. Local LLM Inference Engine — Copilot-to-Anthropic proxy bridge       ║
+║    3. Local LLM Inference Engine — Copilot-to-LAMCAP proxy bridge       ║
 ║    4. Model Trigger Mapping      — Student Token Multiplier display        ║
 ║    5. Execution Interface & UI   — Rich splash + prompt_toolkit REPL       ║
 ║                                                                            ║
@@ -281,7 +281,7 @@ class ContextStore:
 class InferenceEngine:
     """
     Anthropic-compatible client that routes ALL traffic through a local
-    Copilot-to-Anthropic proxy (default: localhost:4141).
+    Copilot-to-LAMCAP proxy (default: localhost:4141).
 
     Environment variables control every tuneable:
       ANTHROPIC_BASE_URL  → proxy endpoint
@@ -337,7 +337,7 @@ class InferenceEngine:
         except anthropic.APIConnectionError as exc:
             raise ConnectionError(
                 f"[LAMCAP] Proxy bridge unreachable at {self.base_url}\n"
-                f"  → Ensure your Copilot-to-Anthropic tunnel is running.\n"
+                f"  → Ensure your Copilot-to-LAMCAP tunnel is running.\n"
                 f"  → Detail: {exc}"
             ) from exc
         except anthropic.APIStatusError as exc:

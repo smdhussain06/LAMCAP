@@ -1,6 +1,6 @@
 # LAMCAP — Local Agentic Multi-Context Automation Protocol
 
-A stateful, multi-agent CLI automation engine that runs entirely on your phone via Termux. No cloud dependencies — inference routes through a local Copilot-to-Anthropic proxy tunnel.
+A stateful, multi-agent CLI automation engine that runs entirely on your phone via Termux. No cloud dependencies — inference routes through a local Copilot-to-LAMCAP proxy tunnel.
 
 ```
 ██       ████   ███ ███  █████   ████   █████ 
@@ -106,11 +106,11 @@ source ~/.bashrc
 
 ---
 
-### Step 8 — Start your Copilot-to-Anthropic proxy
+### Step 8 — Start your Copilot-to-LAMCAP proxy
 
 Make sure your proxy tunnel is running on `localhost:4141` **before** launching LAMCAP. 
 
-> The proxy bridges Copilot inference to an Anthropic-compatible API so your phone doesn't burn through local compute.
+> The proxy bridges Copilot inference to a LAMCAP-compatible API so your phone doesn't burn through local compute.
 
 ---
 
