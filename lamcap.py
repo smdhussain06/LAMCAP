@@ -278,6 +278,24 @@ class ContextStore:
 # 2.  LOCAL LLM INFERENCE ENGINE — The Proxy Bridge
 # ══════════════════════════════════════════════════════════════════════════════
 
+import socket
+from urllib.parse import urlparse
+
+def check_bridge_connection(url: str, timeout: float = 1.0) -> bool:
+    """
+    Check if the proxy bridge is reachable by attempting to open a socket
+    on the host/port specified in the URL.
+    """
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
+
 class InferenceEngine:
     """
     Anthropic-compatible client that routes ALL traffic through a local
@@ -549,7 +567,7 @@ LAMCAP_LOGO = """\
 [/bold purple]"""
 
 
-def render_splash(model: str, multiplier: float) -> None:
+def render_splash(model: str, multiplier: float, is_connected: bool) -> None:
     """
     Clear the terminal and paint a premium LAMCAP splash screen using Rich.
     """
@@ -573,8 +591,13 @@ def render_splash(model: str, multiplier: float) -> None:
     mult_display = format_multiplier(multiplier)
     model_upper = model.upper().replace("-", "-")
 
+    if is_connected:
+        bridge_status = "[bold green]Bridge connected.[/bold green]"
+    else:
+        bridge_status = "[bold red]Bridge disconnected.[/bold red]"
+
     status = (
-        f"[dim]Bridge connected.[/dim]  "
+        f"{bridge_status}  "
         f"[bold purple]{model_upper}[/bold purple] "
         f"[dim]({mult_display})[/dim]  "
         f"[dim]•[/dim]  "
@@ -754,8 +777,11 @@ def main() -> None:
     # ── Resolve model + multiplier ────────────────────────────────────────
     model, multiplier = resolve_model_info()
 
+    # ── Check connection status ───────────────────────────────────────────
+    is_connected = check_bridge_connection(ANTHROPIC_BASE_URL)
+
     # ── Render splash screen ──────────────────────────────────────────────
-    render_splash(model, multiplier)
+    render_splash(model, multiplier, is_connected)
 
     # ── Initialise core layers ────────────────────────────────────────────
     store = ContextStore()
