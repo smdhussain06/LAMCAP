@@ -512,7 +512,11 @@ class AuthManager:
 # 3.  MULTI-AGENT ORCHESTRATION LAYER
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── 3a. Planner Agent ─────────────────────────────────────────────────────
+class PlannerAgent:
+    """
+    Takes a raw user prompt plus SQLite context and asks the LLM to return
+    a JSON-structured list of concrete terminal sub-tasks.
+    """
 
     PLANNER_INSTRUCTIONS = textwrap.dedent("""\
         You are the LAMCAP Agent. You operate in a recursive Plan-Act-Observe loop.
