@@ -967,14 +967,17 @@ def print_history(store: ContextStore) -> None:
 # 6.  EXECUTION PIPELINE & REPL
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_agent_pipeline(prompt: str, engine: BaseEngine, store: ContextStore, planner: PlannerAgent, validator: ValidatorAgent, executor: ExecutorAgent) -> None:
+def run_agent_pipeline(prompt: str, engine: BaseEngine, store: ContextStore, planner: PlannerAgent, validator: ValidatorAgent, executor: ExecutorAgent, auto_accept: bool = False) -> None:
     """The Recursive Plan-Act-Observe Loop with Human-in-the-Loop Feedback."""
     
     current_prompt = prompt
     iteration = 0
-    max_iterations = 25 # Increased for complex debugging
+    max_iterations = 25
     
-    mode = store.get_setting("execution_mode", "NORMAL")
+    # Permission Mode: 
+    permission_mode = store.get_setting("execution_mode", "NORMAL")
+    if auto_accept: 
+        permission_mode = "AUTO"
     
     while iteration < max_iterations:
         iteration += 1
@@ -993,6 +996,8 @@ def run_agent_pipeline(prompt: str, engine: BaseEngine, store: ContextStore, pla
             break
             
         action_cmd = step_plan.get("command")
+        if not action_cmd:
+            break
             
         # 3. VALIDATION & SECURITY
         temp_plan = {"tasks": [step_plan]}
@@ -1003,7 +1008,7 @@ def run_agent_pipeline(prompt: str, engine: BaseEngine, store: ContextStore, pla
             break
 
         # 4. INTERACTIVE APPROVAL & HITL FEEDBACK
-        if mode == "NORMAL":
+        if permission_mode != "AUTO":
             user_input = console.input(f"\n  [bold yellow]?[/bold yellow] Allow command: [italic]{action_cmd}[/italic]? [dim](y/n/conversational feedback)[/dim]\n  [bold cyan]lamcap>[/bold cyan] ").strip()
             
             # Simple 'n' or empty means abort
@@ -1011,8 +1016,11 @@ def run_agent_pipeline(prompt: str, engine: BaseEngine, store: ContextStore, pla
                 console.print("[dim]✗ Session closed.[/dim]\n")
                 break
             
-            # If user types anything OTHER than 'y', it's a pivot!
-            if user_input.lower() != 'y':
+            # If user types 'auto', switch mode for this session
+            if user_input.lower() == 'auto':
+                permission_mode = "AUTO"
+                console.print("[bold green]⟡ Switched to AUTO-ACCEPT mode for this session.[/bold green]")
+            elif user_input.lower() != 'y':
                 console.print(f"\n[bold blue]⟡ Pivoting based on feedback:[/bold blue] [italic]{user_input}[/italic]")
                 current_prompt = f"USER FEEDBACK: {user_input}\n\nPrevious intent was to run: {action_cmd}\nBut do not run that, follow the new feedback instead."
                 continue
@@ -1024,17 +1032,19 @@ def run_agent_pipeline(prompt: str, engine: BaseEngine, store: ContextStore, pla
             
         store.log_execution(action_cmd, result.get("stdout", ""), result.get("stderr", ""), result.get("exit_code", 0))
         
-        # INCREASED DISPLAY LIMITS (Claude Code typically shows more context)
+        # Display to User (Truncated for readability)
         if result.get("stdout"): 
             out = result['stdout']
-            # Show up to 2000 chars to avoid agent thinking logs are truncated
-            display_out = out[:2000] + ("\n[dim]...(output truncated in display)...[/dim]" if len(out) > 2000 else "")
+            display_out = out[:1200] + ("\n[dim]...(output truncated in display)...[/dim]" if len(out) > 1200 else "")
             console.print(f"    [dim]{display_out}[/dim]")
         if result.get("stderr"):
             console.print(f"    [red]{result['stderr'][:1000]}[/red]")
             
-        # The prompt for the NEXT iteration
-        current_prompt = f"Command '{action_cmd}' finished with exit code {result.get('exit_code', 0)}. See latest observation in history to decide the next step."
+        # THE FIX: Return MUCH more data to the Agent's next prompt so it sees the 'Address already in use' error
+        obs_stdout = result.get('stdout', '')[:5000]
+        obs_stderr = result.get('stderr', '')[:5000]
+        
+        current_prompt = f"COMMAND_RESULT:\n$ {action_cmd}\nEXIT_CODE: {result.get('exit_code', 0)}\nSTDOUT: {obs_stdout}\nSTDERR: {obs_stderr}\n\nDecide the next step. If 'Address already in use', try a different port."
 
     if iteration >= max_iterations:
         console.print("[yellow]! Safety cap reached.[/yellow]")
@@ -1043,7 +1053,11 @@ def run_agent_pipeline(prompt: str, engine: BaseEngine, store: ContextStore, pla
 
 
 def main() -> None:
-    """Main execution loop with Menu transition to REPL."""
+    """Main execution loop."""
+    parser = argparse.ArgumentParser(description="LAMCAP Agentic Automation")
+    parser.add_argument("-y", "--auto", action="store_true", help="Auto-accept commands")
+    args, unknown = parser.parse_known_args()
+
     store = ContextStore()
     model = store.get_setting("last_model", ANTHROPIC_MODEL)
     
@@ -1084,7 +1098,7 @@ def main() -> None:
     session = PromptSession(history=FileHistory(REPL_HISTORY_PATH))
 
     if first_prompt:
-        run_agent_pipeline(first_prompt, engine, store, planner, validator, executor)
+        run_agent_pipeline(first_prompt, engine, store, planner, validator, executor, auto_accept=args.auto)
 
     while True:
         try:
@@ -1098,7 +1112,7 @@ def main() -> None:
             elif lowered == "status": print_status(engine)
             elif lowered == "history": print_history(store)
             elif lowered == "clear": os.system("clear")
-            else: run_agent_pipeline(user_input, engine, store, planner, validator, executor)
+            else: run_agent_pipeline(user_input, engine, store, planner, validator, executor, auto_accept=args.auto)
         except (KeyboardInterrupt, EOFError):
             break
     
