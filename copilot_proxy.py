@@ -66,7 +66,7 @@ class CopilotProxyHandler(BaseHTTPRequestHandler):
         openai_req = {
             "model": "gpt-4",  # We force Github Copilot's preferred turbo router
             "messages": openai_msgs,
-            "stream": False,
+            "stream": req.get("stream", False),
             "temperature": 0.1
         }
 
@@ -79,11 +79,40 @@ class CopilotProxyHandler(BaseHTTPRequestHandler):
                 "Accept": "application/json",
                 "Editor-Version": "vscode/1.85.0"
             },
-            json=openai_req
+            json=openai_req,
+            stream=openai_req["stream"]
         )
 
         if res.status_code != 200:
             self.send_error(500, f"Copilot Internal Server Error: {res.text}")
+            return
+
+        if openai_req["stream"]:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+            
+            for line in res.iter_lines():
+                if line:
+                    line = line.decode('utf-8')
+                    if line.startswith("data: ") and line != "data: [DONE]":
+                        try:
+                            # Map OpenAI Server-Sent Events to Anthropic Server-Sent Events dynamically!
+                            data = json.loads(line[6:])
+                            content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                            if content:
+                                anthropic_chunk = {
+                                    "type": "content_block_delta",
+                                    "delta": {"type": "text_delta", "text": content}
+                                }
+                                self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(anthropic_chunk)}\n\n".encode('utf-8'))
+                                self.wfile.flush()
+                        except: pass
+            
+            self.wfile.write(b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
+            self.wfile.flush()
+            print("✓ [Copilot Proxy] Successfully streamed live generated code to LAMCAP Executor!")
             return
 
         out_data = res.json()

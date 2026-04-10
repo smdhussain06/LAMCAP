@@ -358,7 +358,7 @@ class BaseEngine:
         self.model = model
         self.multiplier = MODEL_MULTIPLIER_MAP.get(model, 0.0)
 
-    def infer(self, system_prompt: str, user_message: str, max_tokens: int = 4096) -> str:
+    def infer(self, system_prompt: str, user_message: str, max_tokens: int = 4096, stream: bool = False) -> str | Any:
         raise NotImplementedError
 
 class CloudEngine(BaseEngine):
@@ -374,15 +374,28 @@ class CloudEngine(BaseEngine):
         self.api_key = api_key
         self.client = anthropic.Anthropic(base_url=self.base_url, api_key=self.api_key)
 
-    def infer(self, system_prompt: str, user_message: str, max_tokens: int = 4096) -> str:
+    def infer(self, system_prompt: str, user_message: str, max_tokens: int = 4096, stream: bool = False) -> str | Any:
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_message}],
-            )
-            return "\n".join([b.text for b in response.content if hasattr(b, "text")])
+            if stream:
+                # Returns a generator yielding streamed text chunks
+                def stream_gen():
+                    with self.client.messages.stream(
+                        model=self.model,
+                        max_tokens=max_tokens,
+                        system=system_prompt,
+                        messages=[{"role": "user", "content": user_message}],
+                    ) as s:
+                        for text in s.text_stream:
+                            yield text
+                return stream_gen()
+            else:
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=max_tokens,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_message}],
+                )
+                return "\n".join([b.text for b in response.content if hasattr(b, "text")])
         except anthropic.APIConnectionError:
             raise ConnectionError(f"[LAMCAP] Proxy unreachable at {self.base_url}")
         except Exception as e:
@@ -394,7 +407,7 @@ class LocalEngine(BaseEngine):
         super().__init__(model)
         self.host = host
 
-    def infer(self, system_prompt: str, user_message: str, max_tokens: int = 4096) -> str:
+    def infer(self, system_prompt: str, user_message: str, max_tokens: int = 4096, stream: bool = False) -> str | Any:
         import urllib.request
         import json
         url = f"{self.host}/api/chat"
@@ -404,16 +417,25 @@ class LocalEngine(BaseEngine):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message}
             ],
-            "stream": False,
+            "stream": stream,
             "options": {"num_predict": max_tokens}
         }
         try:
             req = urllib.request.Request(
                 url, data=json.dumps(data).encode("utf-8"), headers={"Content-Type": "application/json"}
             )
-            with urllib.request.urlopen(req, timeout=60) as res:
-                body = json.loads(res.read().decode("utf-8"))
-                return body.get("message", {}).get("content", "")
+            if stream:
+                def stream_gen():
+                    with urllib.request.urlopen(req, timeout=60) as res:
+                        for line in res:
+                            if line:
+                                body = json.loads(line.decode('utf-8'))
+                                yield body.get("message", {}).get("content", "")
+                return stream_gen()
+            else:
+                with urllib.request.urlopen(req, timeout=60) as res:
+                    body = json.loads(res.read().decode("utf-8"))
+                    return body.get("message", {}).get("content", "")
         except Exception as e:
             raise ConnectionError(f"[LAMCAP] Local Ollama error: {e}")
 
@@ -504,12 +526,13 @@ class PlannerAgent:
         executed sequentially in a Linux / Termux shell.
 
         RULES:
-        1. Return ONLY valid JSON — no markdown fences, no commentary.
-        2. Use the exact schema:
+        1. FIRST, wrap your thinking and logic inside a <thought>...</thought> block. Tell the user what you are planning to do natively.
+        2. THEN, return ONLY valid JSON — no markdown fences, no commentary outside the thought block.
+        3. Use the exact schema:
            {"tasks": [{"step": <int>, "command": "<shell command>", "description": "<why>"}]}
-        3. Each command must be a single, self-contained shell invocation.
-        4. Prefer non-destructive, idempotent commands when possible.
-        5. Use the file-system context and history provided to avoid redundant work.
+        4. Each command must be a single, self-contained shell invocation.
+        5. Prefer non-destructive, idempotent commands when possible.
+        6. Use the file-system context and history provided to avoid redundant work.
     """)
 
     def __init__(self, engine: InferenceEngine, store: ContextStore) -> None:
@@ -523,13 +546,23 @@ class PlannerAgent:
         Returns:
             A dict with a "tasks" key containing a list of step dicts.
         """
+        from rich.live import Live
+        from rich.markdown import Markdown
+        from rich.panel import Panel
+
         system_ctx = self.store.build_system_context()
         full_system = f"{self.PLANNER_INSTRUCTIONS}\n\n{system_ctx}"
 
-        raw = self.engine.infer(full_system, user_prompt)
+        raw = ""
+        # Create a dynamic panel that updates live as chunks stream in
+        with Live(Panel(Markdown(""), title="[bold purple]⟡ Planner Thinking...[/bold purple]", border_style="purple"), refresh_per_second=15) as live:
+            for chunk in self.engine.infer(full_system, user_prompt, stream=True):
+                raw += chunk
+                live.update(Panel(Markdown(raw), title="[bold purple]⟡ Planner Thinking...[/bold purple]", border_style="purple"))
 
-        # Attempt to parse JSON — handle LLMs that wrap in markdown fences
-        cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+        # Clean the output by stripping out the <thought> block
+        cleaned = re.sub(r"<thought>.*?</thought>", "", raw, flags=re.DOTALL).strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
 
         try:
@@ -916,8 +949,7 @@ def run_agent_pipeline(prompt: str, engine: BaseEngine, store: ContextStore, pla
     
     # 1. PLANNER STAGE
     try:
-        with console.status("[bold purple]⟡ Planner[/bold purple] [dim]analyzing workspace and reasoning intent…[/dim]", spinner="aesthetic"):
-            plan = planner.plan(prompt)
+        plan = planner.plan(prompt)
     except Exception as exc:
         console.print(f"[bold red]✗ Error:[/bold red] {exc}\n")
         return
